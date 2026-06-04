@@ -31,6 +31,8 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
   const [acting, setActing] = useState<Record<string, string>>({}); // 实例 id → 进行中的动作文案（启动中/升级中…）
   // 未使用的旧数据卷（来自之前删实例时未勾选"彻底清除"）：允许复用以继承聊天记录，或显式删除。
   const [orphanVols, setOrphanVols] = useState<{ name: string; createdAt?: string; sizeBytes?: number }[]>([]);
+  // 残留 woc-wx-* 容器（runInstance 启动失败遗留的 Created 容器等）：占着卷名让删卷报 409。
+  const [orphanConts, setOrphanConts] = useState<{ id: string; name: string; status: string; volumeName?: string }[]>([]);
   const setAct = (id: string, label: string | null) =>
     setActing((a) => {
       const n = { ...a };
@@ -51,12 +53,42 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
     } catch (e: any) {
       setErr(e.message);
     }
-    // 孤儿卷列表独立 catch：docker 卷接口失败不应阻塞用户/实例视图
+    // 孤儿卷 / 残留容器独立 catch：docker 接口失败不应阻塞用户/实例视图
     try {
       const { volumes } = await api.listOrphanVolumes();
       setOrphanVols(volumes);
     } catch {
       /* ignore */
+    }
+    try {
+      const { containers } = await api.listOrphanContainers();
+      setOrphanConts(containers);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const removeOrphanCont = async (c: { id: string; name: string }) => {
+    const ok = await confirm({
+      title: `删除残留容器「${c.name}」？`,
+      body: '此容器不属于任何登记实例（多为创建失败遗留）。删除不会动数据卷，删后才能继续清理同名旧数据卷。',
+      danger: true,
+      confirmText: '删除容器',
+    });
+    if (!ok) return;
+    try {
+      await api.deleteOrphanContainer(c.id);
+      toast('已删除残留容器，可继续清理数据卷', 'ok');
+      setOrphanConts((cs) => cs.filter((x) => x.id !== c.id));
+      // 容器走了之后，原本被它占着的卷可能从"被引用"翻成"孤儿"，刷新一次
+      try {
+        const { volumes } = await api.listOrphanVolumes();
+        setOrphanVols(volumes);
+      } catch {
+        /* ignore */
+      }
+    } catch (e: any) {
+      toast(e.message || '删除失败', 'error');
     }
   };
 
@@ -249,6 +281,34 @@ export default function Admin({ onOpenMenu, onChangePassword }: { onOpenMenu: ()
                   </div>
                 ))}
               </div>
+            )}
+            {orphanConts.length > 0 && (
+              <>
+                <div className="section-row" style={{ marginTop: 22 }}>
+                  <span className="section-title">残留容器</span>
+                  <span className="muted small">不属于任何登记实例（多为创建失败遗留）；它们占着数据卷名，需先清理它们才能删除同名数据卷。</span>
+                </div>
+                <div className="inst-grid">
+                  {orphanConts.map((c) => (
+                    <div key={c.id} className="inst-card">
+                      <div className="inst-head">
+                        <span className="inst-name" style={{ fontFamily: 'monospace', fontSize: 13 }}>{c.name}</span>
+                        <span className="tag tag-off">{c.status || 'unknown'}</span>
+                      </div>
+                      {c.volumeName && (
+                        <div className="inst-sub" style={{ fontFamily: 'monospace', fontSize: 12 }}>
+                          占用卷：{c.volumeName}
+                        </div>
+                      )}
+                      <div className="inst-admin-links">
+                        <button className="btn-text danger" onClick={() => removeOrphanCont(c)}>
+                          删除容器
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
             )}
             {orphanVols.length > 0 && (
               <>

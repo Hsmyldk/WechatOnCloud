@@ -129,7 +129,18 @@ export async function runInstance(inst: Instance): Promise<void> {
     ExposedPorts: { '3000/tcp': {} },
     HostConfig: hostConfig,
   });
-  await container.start();
+  try {
+    await container.start();
+  } catch (e) {
+    // 启动失败但容器已被创建出来（Created 状态），不清理的话会成为"幽灵容器"——
+    // 它仍占着卷名 woc-data-<id>，让后续删卷报 409。修复 #23 时发现 4 个此类残留。
+    try {
+      await container.remove({ force: true });
+    } catch {
+      /* 容器已被外部移走或正在被清理，忽略 */
+    }
+    throw e;
+  }
 }
 
 // 确保实例容器在运行：缺失则按需创建（不会重建已有卷），停止则启动。
@@ -179,20 +190,31 @@ export async function removeInstance(inst: Instance, purgeVolume: boolean): Prom
   }
 }
 
-// 列出"未被任何实例引用的 woc-data-* 数据卷"。删除实例时默认保留卷（聊天记录），但 panel 里没有
-// UI 能看到这些孤儿卷；本接口让管理员可显式：在新建实例时复用旧卷继承聊天记录，或彻底删除。
-// 仅看名字前缀 + docker 卷视角，不读卷内文件（避免提权访问）。
+// 列出"未被任何容器引用的 woc-data-* 数据卷"。判定改为 docker 真实视角（不再仅看 store），
+// 否则 Created 状态的"幽灵容器"会让卷被误判为孤儿，删除时撞 409（real-world issue：
+// 早期 runInstance 启动失败漏清残留容器，留下 4 个 Created 容器各占一个卷名）。
 export async function listOrphanVolumes(referencedVolumes: Set<string>): Promise<
   Array<{ name: string; createdAt?: string; sizeBytes?: number }>
 > {
+  // 容器视角：扫所有容器（含已停止 / Created），收集它们挂载的 woc-data-* 卷名
+  const allContainers = await docker.listContainers({ all: true });
+  const containerRefs = new Set<string>();
+  for (const c of allContainers) {
+    for (const m of c.Mounts || []) {
+      if (typeof m.Name === 'string' && m.Name.startsWith('woc-data-')) containerRefs.add(m.Name);
+    }
+  }
+  // 与 store 视角并集：取两者都未引用的卷
+  const referenced = new Set<string>([...referencedVolumes, ...containerRefs]);
+
   const { Volumes } = (await (docker as any).listVolumes()) || { Volumes: [] };
   if (!Array.isArray(Volumes)) return [];
   return Volumes
-    .filter((v: any) => typeof v?.Name === 'string' && v.Name.startsWith('woc-data-') && !referencedVolumes.has(v.Name))
+    .filter((v: any) => typeof v?.Name === 'string' && v.Name.startsWith('woc-data-') && !referenced.has(v.Name))
     .map((v: any) => ({
       name: v.Name,
       createdAt: v.CreatedAt,
-      // UsageData 仅在 docker engine 启用 -v size=true 时返回，常见情况下没有；缺失就不展示，避免一次 inspect 风暴
+      // UsageData 仅在 docker engine 启用 -v size=true 时返回，常见情况下没有；缺失就不展示
       sizeBytes: typeof v?.UsageData?.Size === 'number' && v.UsageData.Size >= 0 ? v.UsageData.Size : undefined,
     }))
     .sort((a, b) => (a.createdAt && b.createdAt ? (a.createdAt < b.createdAt ? 1 : -1) : 0));
@@ -201,6 +223,28 @@ export async function listOrphanVolumes(referencedVolumes: Set<string>): Promise
 // 显式删除一个数据卷（管理员清理孤儿卷用）。调用方负责确认它不被现存实例引用。
 export async function removeVolume(name: string): Promise<void> {
   await docker.getVolume(name).remove({ force: true } as any);
+}
+
+// 列出"残留的 woc-wx-* 容器"：在 docker 里存在但 store 没登记的（多为 runInstance 失败时
+// 留下的 Created 状态容器，或用户手动 docker run 出来的）。给管理员一键清理。
+export async function listOrphanContainers(
+  knownContainerNames: Set<string>,
+): Promise<Array<{ id: string; name: string; status: string; volumeName?: string }>> {
+  const all = await docker.listContainers({ all: true });
+  const out: Array<{ id: string; name: string; status: string; volumeName?: string }> = [];
+  for (const c of all) {
+    const name = (c.Names || []).map((n) => n.replace(/^\//, '')).find((n) => n.startsWith('woc-wx-'));
+    if (!name) continue;
+    if (knownContainerNames.has(name)) continue;
+    const vol = (c.Mounts || []).map((m) => m.Name).find((n) => typeof n === 'string' && n.startsWith('woc-data-'));
+    out.push({ id: c.Id, name, status: c.Status || c.State || '', volumeName: vol });
+  }
+  return out;
+}
+
+// 强制删除一个残留容器（按短/全 id 或容器名都行）。
+export async function removeContainerById(idOrName: string): Promise<void> {
+  await docker.getContainer(idOrName).remove({ force: true });
 }
 
 // 取实例容器的"working set"内存（MB）：等同 docker stats 显示值 = usage - inactive_file。

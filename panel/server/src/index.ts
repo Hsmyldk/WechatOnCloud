@@ -50,6 +50,8 @@ import {
   typeInInstance,
   listOrphanVolumes,
   removeVolume,
+  listOrphanContainers,
+  removeContainerById,
   instanceMemoryMB,
 } from './docker.js';
 import { createSession, getSession, destroySession, destroyUserSessions } from './sessions.js';
@@ -270,6 +272,35 @@ app.get('/api/admin/orphan-volumes', async (req, reply) => {
     return { volumes };
   } catch (e: any) {
     return reply.code(500).send({ error: e?.message || '读取数据卷失败' });
+  }
+});
+
+// 列出"残留的 woc-wx-* 容器"：docker 里存在但 store 没登记。多为 runInstance 启动失败遗留
+// 的 Created 容器，会占着 woc-data-<id> 卷名让删卷报 409。提供给管理员一键清理。
+app.get('/api/admin/orphan-containers', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const known = new Set(listInstances().map((i) => i.containerName));
+  try {
+    const containers = await listOrphanContainers(known);
+    return { containers };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '读取容器失败' });
+  }
+});
+
+// 强制删除一个残留容器。仅当它不在 store 的已知容器集中（防误删正在用的实例）。
+app.delete('/api/admin/orphan-containers/:idOrName', async (req, reply) => {
+  if (!requireAdmin(req, reply)) return;
+  const idOrName = (req.params as any).idOrName;
+  if (!idOrName || typeof idOrName !== 'string') return reply.code(400).send({ error: '参数不合法' });
+  if (listInstances().some((i) => i.containerName === idOrName)) {
+    return reply.code(409).send({ error: '该容器属于现存实例，不能在此删除' });
+  }
+  try {
+    await removeContainerById(idOrName);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '删除容器失败' });
   }
 });
 

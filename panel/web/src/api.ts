@@ -102,6 +102,10 @@ export const api = {
     req<{ volumes: { name: string; createdAt?: string; sizeBytes?: number }[] }>('/api/admin/orphan-volumes'),
   deleteOrphanVolume: (name: string) =>
     req(`/api/admin/orphan-volumes/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  listOrphanContainers: () =>
+    req<{ containers: { id: string; name: string; status: string; volumeName?: string }[] }>('/api/admin/orphan-containers'),
+  deleteOrphanContainer: (idOrName: string) =>
+    req(`/api/admin/orphan-containers/${encodeURIComponent(idOrName)}`, { method: 'DELETE' }),
   renameInstance: (id: string, name: string) =>
     req<{ instance: PanelInstance }>(`/api/admin/instances/${id}/rename`, { method: 'POST', body: JSON.stringify({ name }) }),
   deleteInstance: (id: string, purge = false) =>
