@@ -25,15 +25,32 @@ export interface User {
 // 初始默认管理员密码；管理员仍在用它时强烈提示改密。
 const DEFAULT_ADMIN_PASSWORD = 'wechat';
 
+// v1.2.0：实例可承载多种应用（不止微信）。同一镜像运行时按 appType 安装/启动对应应用。
+export type AppType = 'wechat' | 'telegram' | 'chromium' | 'custom';
+export const APP_TYPES: AppType[] = ['wechat', 'telegram', 'chromium', 'custom'];
+export const APP_LABELS: Record<AppType, string> = {
+  wechat: '微信',
+  telegram: 'Telegram',
+  chromium: '浏览器',
+  custom: '自定义应用',
+};
+// 向后兼容：v1.2.0 之前创建的实例没有 appType 字段，一律视为微信。
+export function instanceAppType(i: Instance): AppType {
+  return i.appType && APP_TYPES.includes(i.appType) ? i.appType : 'wechat';
+}
+
 export interface Instance {
   id: string; // 短 id，用于容器/卷命名
   name: string; // 显示名
+  appType?: AppType; // 承载的应用类型；缺省（老实例）= wechat（见 instanceAppType）
   containerName: string; // woc-wx-<id>
   volumeName: string; // woc-data-<id>
   kasmUser: string; // 随机生成，服务端注入反代，永不下发前端
   kasmPassword: string;
   createdAt: string;
   createdBy: string; // userId
+  // 自定义应用（appType=custom）：用户上传的安装包信息，autostart 据此启动。
+  customLaunch?: string; // 启动命令（容器内绝对路径或命令）
   // 自愈 watchdog 的"安全阀"，per-instance 覆盖全局默认；缺省时使用 env / 内置默认。
   // soft：内存超此值时，仅在"当前没有用户在远程会话"才主动重启（柔和自愈）；
   // hard：内存超此值时，无论是否有人在会话都重启（防止 OOM 拖垮宿主）。
@@ -198,6 +215,7 @@ export function publicInstance(i: Instance) {
   return {
     id: i.id,
     name: i.name,
+    appType: instanceAppType(i), // 老实例无字段时回退 wechat
     createdAt: i.createdAt,
     createdBy: i.createdBy,
     memSoftLimitMB: i.memSoftLimitMB,
@@ -263,7 +281,9 @@ export function createInstance(
   createdBy: string,
   allowedUserIds: string[] = [],
   reuseVolumeName?: string,
+  appType: AppType = 'wechat',
 ) {
+  const type: AppType = APP_TYPES.includes(appType) ? appType : 'wechat';
   let id = randomBytes(5).toString('hex'); // 10 hex chars
   let volumeName = `woc-data-${id}`;
   if (reuseVolumeName) {
@@ -275,7 +295,8 @@ export function createInstance(
   }
   const inst: Instance = {
     id,
-    name: name.trim() || `微信-${id.slice(0, 4)}`,
+    name: name.trim() || `${APP_LABELS[type]}-${id.slice(0, 4)}`,
+    appType: type,
     containerName: `woc-wx-${id}`,
     volumeName,
     kasmUser: 'woc',
