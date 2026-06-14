@@ -14,6 +14,74 @@ function desktopUrl(id: string) {
   );
 }
 
+// 「无感输入」钩子：装进同源 iframe，让用户直接在微信里打中文。
+// - compositionend（中文提交）→ 经 xclip+xdotool 转发（绕开 VNC keysym 容量上限）。
+// - 转发未完成期间（队列活跃），把后续可见字符 + 回车/退格也串进同一队列按序送出 →
+//   彻底消除"中文走异步、数字走 keysym 抢跑"导致的"你好123→23"丢字。
+// - 队列空闲时不干预：英文/数字仍走原生 keysym，零延迟。
+// 返回清理函数（切回转发模式 / 重连 / 卸载时移除监听）。
+function installSeamlessIme(win: Window, doc: Document, instId: string): () => void {
+  type Job = { kind: 'text'; data: string } | { kind: 'key'; data: string };
+  const queue: Job[] = [];
+  let draining = false;
+  const active = () => draining || queue.length > 0;
+
+  const drain = async () => {
+    if (draining) return;
+    draining = true;
+    while (queue.length) {
+      const job = queue[0];
+      try {
+        if (job.kind === 'text') await api.typeInInstance(instId, job.data);
+        else await api.keyInInstance(instId, job.data);
+      } catch {
+        /* 单条失败丢弃，继续后续，避免卡住队列 */
+      }
+      queue.shift();
+    }
+    draining = false;
+  };
+
+  const onCompositionEnd = (e: Event) => {
+    const txt = (e as CompositionEvent).data;
+    if (!txt) return;
+    queue.push({ kind: 'text', data: txt });
+    drain();
+  };
+
+  // 捕获阶段（iframe window 最外层）抢先拦截，赶在 noVNC 之前 → stopImmediatePropagation 阻止它发 keysym。
+  const onKeyDownCapture = (ev: Event) => {
+    const e = ev as KeyboardEvent;
+    if (e.isComposing) return; // 拼音合成中，交给输入法
+    if (e.ctrlKey || e.altKey || e.metaKey) return; // 快捷键放行
+    if (!active()) return; // 没有中文在转发 → 不接管（英文/数字走原生 keysym，零延迟）
+    if (e.key.length === 1) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      queue.push({ kind: 'text', data: e.key });
+      drain();
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      queue.push({ kind: 'key', data: 'Return' });
+      drain();
+    } else if (e.key === 'Backspace') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      queue.push({ kind: 'key', data: 'BackSpace' });
+      drain();
+    }
+    // 其它非可见键（方向键/功能键等）放行
+  };
+
+  doc.addEventListener('compositionend', onCompositionEnd, true);
+  win.addEventListener('keydown', onKeyDownCapture, true);
+  return () => {
+    doc.removeEventListener('compositionend', onCompositionEnd, true);
+    win.removeEventListener('keydown', onKeyDownCapture, true);
+  };
+}
+
 interface TFile {
   name: string;
   size: number;
@@ -46,8 +114,22 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
   const [files, setFiles] = useState<TFile[]>([]);
   const [showClip, setShowClip] = useState(false);
   const [clipText, setClipText] = useState('');
-  // 中文输入条：面板里的真实 textarea（原生客户端输入法 100% 可用），回车经 xclip+xdotool 粘进微信。
-  const [imeBar, setImeBar] = useState(true); // 默认开（直接在 VNC 里打中文不稳，给一个可靠通道）
+  // 中文输入模式：'forward'=底部输入条转发（默认，最稳）；'seamless'=无感（直接在微信里打，提交后转发）。
+  const [inputMode, setInputMode] = useState<'forward' | 'seamless'>(() => {
+    try {
+      return window.localStorage.getItem('woc_input_mode') === 'seamless' ? 'seamless' : 'forward';
+    } catch {
+      return 'forward';
+    }
+  });
+  const setMode = (m: 'forward' | 'seamless') => {
+    setInputMode(m);
+    try {
+      window.localStorage.setItem('woc_input_mode', m);
+    } catch {
+      /* 隐私模式禁用 localStorage：忽略 */
+    }
+  };
   const [imeText, setImeText] = useState('');
   const [imeSending, setImeSending] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -203,18 +285,27 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
     };
   }, [showVnc, id, frameLoaded]);
 
-  // 每次进入/重连桌面前，强制把 KasmVNC 的 enable_ime 设为【关】。
-  // 原因：开启 IME 模式后，noVNC 用隐藏 textarea + 合成事件还原中文，需要前端拦截/差分，环环相扣极脆，
-  // 实测会"中文混数字时丢最后两个汉字+首个数字"等损坏。中文输入改由底部「中文输入条」可靠承担
-  // （面板真实 textarea 原生输入法 → xclip+xdotool 粘贴），故 VNC 直接打字回归纯 keysym：英文/数字/
-  // 标点都正常、不再损坏；中文直接打不进（请用输入条）。iframe 同源共享 localStorage，加载前设好即生效。
+  // 进入/重连桌面前，按输入模式设 KasmVNC 的 enable_ime（iframe 同源共享 localStorage，加载前设好即生效）。
+  //   无感（seamless）：enable_ime=true，启用 noVNC 合成 textarea；中文 keysym 已被容器补丁抑制，
+  //     成品由「无感输入」钩子经 xdotool 转发（见 installSeamlessIme）。
+  //   转发（forward）：enable_ime=false，VNC 直接打字纯 keysym（英文/数字正常）；中文走底部输入条。
   useEffect(() => {
     try {
-      window.localStorage.setItem('enable_ime', 'false');
+      window.localStorage.setItem('enable_ime', inputMode === 'seamless' ? 'true' : 'false');
     } catch {
       /* 隐私模式等禁用 localStorage：忽略 */
     }
-  }, [id, vncNonce]);
+  }, [id, vncNonce, inputMode]);
+
+  // 无感模式：往同源 iframe 装「中文转发 + 有序队列」钩子；切回转发/重连/卸载时自动移除。
+  useEffect(() => {
+    if (inputMode !== 'seamless' || !showVnc || !frameLoaded || !id) return;
+    const win = frameRef.current?.contentWindow;
+    const doc = frameRef.current?.contentDocument;
+    if (!win || !doc) return;
+    const cleanup = installSeamlessIme(win, doc, id);
+    return cleanup;
+  }, [inputMode, showVnc, frameLoaded, id, vncNonce]);
 
   // 音频/麦克风桥接：实例就绪即自动连接 kclient 的音频流（扬声器恒开，无需手动找工具条）；
   // 仅当本实例处于焦点（标签页可见且窗口聚焦）时出声/收音，失焦立即断开，避免多实例多端串音。
@@ -449,11 +540,15 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               文件
             </button>
             <button
-              className={'ws-action' + (imeBar ? ' on' : '')}
-              title="底部中文输入条：用本机输入法打中文，回车送进微信（最可靠）"
-              onClick={() => setImeBar((v) => !v)}
+              className={'ws-action' + (inputMode === 'seamless' ? ' on' : '')}
+              title={
+                inputMode === 'seamless'
+                  ? '无感输入：直接在微信输入框里打中文（提交后转发，已修复混数字丢字）。点击切回「转发输入条」'
+                  : '转发输入：用底部输入条打中文，最稳。点击切到「无感输入」（直接在微信里打）'
+              }
+              onClick={() => setMode(inputMode === 'seamless' ? 'forward' : 'seamless')}
             >
-              中文输入
+              输入：{inputMode === 'seamless' ? '无感' : '转发'}
             </button>
             <button
               className="ws-action"
@@ -552,8 +647,8 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
               setTimeout(() => {
                 focusFrame(); // 加载完把键盘焦点交给 VNC
                 injectVncStyle(); // 让原生控制条在深色背景下可见
-                // 注意：不再调用 patchVncIme —— enable_ime 已关，直接打字走纯 keysym（英文/数字正常）；
-                // 中文由底部「中文输入条」承担。那套合成拦截既脆弱又会损坏混合输入，已弃用。
+                // 无感输入模式的键盘钩子由单独的 effect（依赖 inputMode/frameLoaded）安装，不在此处；
+                // 转发模式则 enable_ime=false，直接打字走纯 keysym（英文/数字正常），中文用底部输入条。
               }, 500);
             }}
           />
@@ -690,7 +785,7 @@ export default function InstanceView({ onOpenMenu }: { onOpenMenu: () => void })
           )}
           </div>
 
-          {imeBar && (
+          {inputMode === 'forward' && (
             <div className="iv-imebar">
               <textarea
                 className="iv-imebar-input"

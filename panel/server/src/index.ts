@@ -48,6 +48,7 @@ import {
   deleteInstanceFile,
   instanceLogs,
   typeInInstance,
+  keyInInstance,
   listOrphanVolumes,
   removeVolume,
   listOrphanContainers,
@@ -629,6 +630,22 @@ app.post('/api/instances/:id/type', async (req, reply) => {
     return { ok: true };
   } catch (e: any) {
     return reply.code(500).send({ error: e?.message || '输入失败' });
+  }
+});
+
+// 模拟单个按键（无感输入模式下按序送出被截下的回车/退格，保证与中文转发的顺序）
+app.post('/api/instances/:id/key', async (req, reply) => {
+  const u = requireAuth(req, reply);
+  if (!u) return;
+  const id = (req.params as any).id;
+  if (!userCanAccess(u, id)) return reply.code(403).send({ error: '无权访问该实例' });
+  const { key } = (req.body as any) ?? {};
+  if (!key || typeof key !== 'string') return reply.code(400).send({ error: '按键名为空' });
+  try {
+    await keyInInstance(findInstance(id)!, key);
+    return { ok: true };
+  } catch (e: any) {
+    return reply.code(500).send({ error: e?.message || '按键失败' });
   }
 });
 

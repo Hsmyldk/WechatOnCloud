@@ -582,6 +582,22 @@ export async function typeInInstance(inst: Instance, text: string): Promise<void
   await execCapture(inst, ['bash', '-c', cmd]);
 }
 
+// 通过 xdotool 在实例容器内模拟一次按键（如 Return / BackSpace）。
+// 用于「无感输入」模式：中文经 xclip 转发期间，把被截下的回车/退格按序送出，保证顺序、避免抢跑。
+// key 仅允许字母与下划线（xdotool keysym 名），杜绝注入。
+export async function keyInInstance(inst: Instance, key: string): Promise<void> {
+  if (!/^[A-Za-z_]{1,20}$/.test(key)) throw new Error('按键名不合法');
+  const cmd = [
+    'set -e',
+    'display="${DISPLAY:-}"',
+    'if [ -z "$display" ]; then for x in /tmp/.X11-unix/X*; do [ -e "$x" ] || continue; display=":${x##*X}"; break; done; fi',
+    'export DISPLAY="${display:-:1}"',
+    'command -v xdotool >/dev/null 2>&1 || { echo "xdotool not installed in instance image" >&2; exit 127; }',
+    `xdotool key --clearmodifiers ${key}`,
+  ].join('; ');
+  await execCapture(inst, ['bash', '-c', cmd]);
+}
+
 // ---------- 数据卷管理（仅管理员；路由层用 requireAdmin 限制） ----------
 // 数据卷 = 容器内 /config 持久卷，含微信全部数据（登录态、加密聊天库等）。提供浏览/上传/解压/下载/
 // 改名/移动/删除 + 整卷备份/恢复。主要场景：把 PC 微信数据迁移上来、跨实例迁移、离线备份。
